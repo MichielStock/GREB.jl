@@ -243,6 +243,15 @@ line each model year (stdout is the only progress reporting).
   them through local views/bindings which limits the damage, but plain
   broadcasts and scalar reads pay full price. Fixing this is Phase 2 of the
   packaging workplan and should be benchmarked with `benchmark/benchmarks.jl`.
+- **Measured baseline (2026-07-17, Julia 1.12.6, M-series laptop):** one
+  control year `greb_model!(0, 1, 0, cfg)` on unloaded (zero) data takes
+  **≈26 s and allocates ≈26.5 GB** (5% GC) — the boxing from non-`const`
+  global reads dwarfs everything the workspace preallocation saves
+  (~36 MB/step vs. the ~37 KB a buffer avoids). Post-`const`-sweep target:
+  allocations ≈ monthly output copies only (~6 MB/yr). Re-measure after
+  Phase 2. Note: 4 workspace fields are dead (`temp_buf`, `dTxh`, `dX_crcl`,
+  `cE_buf` — the last is bug B2) and `eva`/`rain`/`crcl` are permanently-zero
+  fallbacks replaceable by one shared read-only constant.
 
 ---
 
