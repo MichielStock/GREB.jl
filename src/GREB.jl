@@ -15,8 +15,6 @@ module GREB
 # =============================================================================
 
 using Statistics
-using NCDatasets
-using StaticArrays        # static longitude indices
 using LoopVectorization   # @turbo SIMD
 
 export PhysicsConfig, CirculationWorkspace, MonthlyAccumulator, TimeState, MonthlyRecord
@@ -254,9 +252,6 @@ begin
 
     # Climatology dataset loaded by `load_greb_jdal2!` (:none until data is loaded)
     const LOADED_DATASET = Ref(:none)
-
-    # 🎯 Cached Weight Arrays (avoid recomputation) ───
-    global WZ_CACHE = Dict{Float64,Matrix{Float64}}()
 end;
 
 # ── notebook cell d0d74213-96ad-4a45-9a31-37f640a21a45  (orig lines 378-400) ──
@@ -301,7 +296,6 @@ begin
     mutable struct CirculationWorkspace
         # Polar sub-stepping buffers
         T1h::Vector{Float64}      # polar sub-stepping
-        dTxh::Vector{Float64}     # polar tendencies
 
         # Circulation work arrays
         X_work::Matrix{Float64}   # circulation work array
@@ -311,7 +305,6 @@ begin
         dX_crcl::Matrix{Float64}  # circulation output
 
         # Tendency buffers 
-        temp_buf::Matrix{Float64}   # general workspace
         Q_sens_buf::Matrix{Float64} # Sensible heat flux buffer
         eva::Matrix{Float64}        # dq_eva
         rain::Matrix{Float64}       # dq_rain
@@ -369,13 +362,11 @@ begin
     function CirculationWorkspace()
         CirculationWorkspace(
             zeros(Float64, xdim),# T1h
-            zeros(Float64, xdim),# dTxh
             zeros(Float64, xdim, ydim),# X_work
             zeros(Float64, xdim, ydim),# dX_diff
             zeros(Float64, xdim, ydim),# dX_adv
             zeros(Float64, xdim, ydim),# dX_conv
             zeros(Float64, xdim, ydim),# dX_crcl
-            zeros(Float64, xdim, ydim),# temp_buf
             zeros(Float64, xdim, ydim), # Q_sens_buf
             zeros(Float64, xdim, ydim), # rain	
             zeros(Float64, xdim, ydim),# eva
@@ -511,7 +502,6 @@ begin
     # 🌍 Spatial CO₂ masking arrays ────────────────────────────────
     # Spatial fraction for regional CO₂ experiments
     co2_part = ones(Float64, xdim, ydim)    # Regional CO₂ mask (1.0 = full CO₂, 0.5 = half CO₂)
-    co2_part_scn = ones(Float64, xdim, ydim) # Scenario-specific spatial mask
 end;
 
 # ── notebook cell f8a2c2de-5045-4ab6-a6fa-7bca502afc9b  (orig lines 644-658) ──
@@ -610,7 +600,6 @@ end
 # ── notebook cell 0dbfb663-46e7-4873-ac77-1e8e392fe69d  (orig lines 737-749) ──
 begin
     # ☀️ Solar forcing storage
-    global sw_solar_forcing_data = nothing  # Will hold (48, 730) array when loaded
     global sw_solar_forcing_state = Ref(1.0)  # Runtime solar multiplier used by SWradiation!
 
     # 🔧 Flux correction arrays (initialised with zeros, overwritten if files exist)
@@ -692,12 +681,6 @@ begin
     uclim_p = zeros(Float64, xdim, ydim, nstep_yr)   # u where u < 0 (westward), else 0
     vclim_m = zeros(Float64, xdim, ydim, nstep_yr)   # v where v >= 0 (northward), else 0
     vclim_p = zeros(Float64, xdim, ydim, nstep_yr)   # v where v < 0 (southward), else 0
-
-    # Initialize wind component separation (CRITICAL: affects advection)
-    @. uclim_m = ifelse(uclim >= 0.0, uclim, 0.0)  # positive winds only
-    @. uclim_p = ifelse(uclim < 0.0, uclim, 0.0)   # negative winds only
-    @. vclim_m = ifelse(vclim >= 0.0, vclim, 0.0)  # positive winds only
-    @. vclim_p = ifelse(vclim < 0.0, vclim, 0.0)   # negative winds only
     Toclim = zeros(Float64, xdim, ydim, nstep_yr)   # deep ocean temperature [K]
     cldclim = zeros(Float64, xdim, ydim, nstep_yr)   # cloud cover fraction
     swetclim = zeros(Float64, xdim, ydim, nstep_yr)   # soil wetness [0-1]
@@ -854,39 +837,6 @@ begin
     qsensmn = zeros(Float64, xdim, ydim)   # sensible heat flux
     ftmn = zeros(Float64, xdim, ydim)   # temperature flux correction
     fqmn = zeros(Float64, xdim, ydim)   # humidity flux correction
-end;
-
-# ── notebook cell a8b5fa01-0526-46f4-9aa0-31b52398a2bd  (orig lines 1124-1143) ──
-begin
-    # Monthly-mean buffers (xdim, ydim) 
-    Tmm = zeros(Float64, xdim, ydim)   # surface temperature
-    Tamm = zeros(Float64, xdim, ydim)   # air temperature
-    Tomm = zeros(Float64, xdim, ydim)   # deep ocean temperature
-    qmm = zeros(Float64, xdim, ydim)   # humidity
-    apmm = zeros(Float64, xdim, ydim)   # albedo
-
-    # additional monthly buffers
-    icmm = zeros(Float64, xdim, ydim)   # ice cover fraction
-    prmm = zeros(Float64, xdim, ydim)   # precipitation tendency
-    evmm = zeros(Float64, xdim, ydim)   # evaporation tendency
-    qcrclmm = zeros(Float64, xdim, ydim)   # circulation tendency
-    swmm = zeros(Float64, xdim, ydim)   # shortwave radiation
-    lwmm = zeros(Float64, xdim, ydim)   # longwave radiation
-    qlatmm = zeros(Float64, xdim, ydim)   # latent heat flux
-    qsensmm = zeros(Float64, xdim, ydim)   # sensible heat flux
-end;
-
-# ── notebook cell 1bdeea50-a73b-47a5-b941-d9d3374f54cf  (orig lines 1144-1156) ──
-begin
-    # Control run monthly means (for anomaly calculation)
-    Tmn_ctrl = zeros(Float64, xdim, ydim, 12)  # surface temperature
-    Tamn_ctrl = zeros(Float64, xdim, ydim, 12)  # air temperature
-    Tomn_ctrl = zeros(Float64, xdim, ydim, 12)  # deep ocean temperature
-    qmn_ctrl = zeros(Float64, xdim, ydim, 12)  # humidity
-    icmn_ctrl = zeros(Float64, xdim, ydim, 12)  # ice cover
-    prmn_ctrl = zeros(Float64, xdim, ydim, 12)  # precipitation
-    evamn_ctrl = zeros(Float64, xdim, ydim, 12)  # evaporation
-    qcrclmn_ctrl = zeros(Float64, xdim, ydim, 12) # circulation
 end;
 
 # ── notebook cell 7a06bf0d-a61c-4d28-b144-2725fe90ae62  (orig lines 1179-1182) ──
