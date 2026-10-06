@@ -168,7 +168,7 @@ Base.@kwdef mutable struct PhysicsConfig
     # Experiment Type
     experiment::Symbol = :full_model  # :full_model, :constant_topo, :co2_double, etc.
 
-    # CO₂ concentration for experiments (ppm)
+    # Control-run CO₂ concentration (ppm). Scenario CO₂ is set per experiment by `forcing`.
     co2_concentration::Float64 = 340.0
 
     # Solar forcing multiplier
@@ -191,12 +191,12 @@ begin
     # Experiments
     - `:full_model` - All processes active (default)
     - `:constant_topo` - Constant topography (log_topo_drsp = false)
-    - `:co2_double` - 2×CO₂ (680 ppm)
-    - `:co2_quadruple` - 4×CO₂ (1360 ppm)
+    - `:co2_double` - 2×CO₂ scenario (680 ppm; control stays at 340 ppm)
+    - `:co2_quadruple` - 4×CO₂ scenario (1360 ppm; control stays at 340 ppm)
     - `:solar_plus27` - +27 W/m² solar constant
     - `:elnino` - El Niño conditions
     - `:lanina` - La Niña conditions  
-    - `:paleo_231kyr` - Paleoclimate (200 ppm CO₂)
+    - `:paleo_231kyr` - Paleoclimate scenario (200 ppm CO₂; control stays at 340 ppm)
     - `:rcp85` - RCP8.5 climate change scenario
     """
     function create_experiment_config(experiment::Symbol)::PhysicsConfig
@@ -209,14 +209,10 @@ begin
             return cfg
 
         elseif experiment == :co2_double
-            cfg = PhysicsConfig(experiment=:co2_double)
-            cfg.co2_concentration = 680.0  # 2×CO₂
-            return cfg
+            return PhysicsConfig(experiment=:co2_double)  # scenario CO₂ = 680 ppm via `forcing`
 
         elseif experiment == :co2_quadruple
-            cfg = PhysicsConfig(experiment=:co2_quadruple)
-            cfg.co2_concentration = 1360.0  # 4×CO₂
-            return cfg
+            return PhysicsConfig(experiment=:co2_quadruple)  # scenario CO₂ = 1360 ppm via `forcing`
 
         elseif experiment == :solar_plus27
             cfg = PhysicsConfig(experiment=:solar_plus27)
@@ -232,9 +228,7 @@ begin
             return cfg
 
         elseif experiment == :paleo_231kyr
-            cfg = PhysicsConfig(experiment=:paleo_231kyr)
-            cfg.co2_concentration = 200.0
-            return cfg
+            return PhysicsConfig(experiment=:paleo_231kyr)  # scenario CO₂ = 200 ppm via `forcing`
 
         elseif experiment == :rcp85
             cfg = PhysicsConfig(experiment=:rcp85)
@@ -248,14 +242,18 @@ end;
 
 # ── notebook cell 32b531ab-ee71-4685-af65-a2bae0b868f6  (orig lines 363-377) ──
 begin
-    # 💧 Optimized Hydrology Parameter Lookup Table ────────────────────────
-    const HYDRO_PARAMS = (
+    # 💧 Hydrology Parameter Lookup Table: log_rain => (c_q, c_rq, c_omega, c_omegastd)
+    const HYDRO_PARAMS = Dict{Int,NTuple{4,Float64}}(
         -1 => (1.0, 0.0, 0.0, 0.0),                      # Original GREB
         1 => (-1.391649, 3.018774, 0.0, 0.0),         # +Relative humidity
         2 => (0.862162, 0.0, -29.02096, 0.0),         # +Omega convergence
         3 => (-0.2685845, 1.4591853, -26.9858807, 0.0), # +RH & Omega
         0 => (-1.88, 2.25, -17.69, 59.07)             # Best GREB (ERA-Interim)
     )
+    const HYDRO_PARAMS_NCEP = (-1.27, 1.99, -16.54, 21.15)  # Best GREB, NCEP (log_rain=0, log_clim=1)
+
+    # Climatology dataset loaded by `load_greb_jdal2!` (:none until data is loaded)
+    const LOADED_DATASET = Ref(:none)
 
     # 🎯 Cached Weight Arrays (avoid recomputation) ───
     global WZ_CACHE = Dict{Float64,Matrix{Float64}}()
@@ -266,22 +264,30 @@ end;
 """
     set_hydrology_parameters!(cfg::PhysicsConfig)
 
-Initialize precipitation parameters `c_q, c_rq, c_omega, c_omegastd` based on
-`cfg.log_rain` and `cfg.log_clim` settings.
+Set the precipitation parameters `cfg.c_q, cfg.c_rq, cfg.c_omega, cfg.c_omegastd`
+from `cfg.log_rain` and `cfg.log_clim` (0 = ERA-Interim, 1 = NCEP coefficients).
+Warns if `log_clim` does not match the dataset loaded by `load_greb_jdal2!`.
 """
 function set_hydrology_parameters!(cfg::PhysicsConfig)
-    global c_q, c_rq, c_omega, c_omegastd
+    haskey(HYDRO_PARAMS, cfg.log_rain) ||
+        throw(ArgumentError("Unknown log_rain = $(cfg.log_rain); valid values are $(sort(collect(keys(HYDRO_PARAMS))))"))
+    params = HYDRO_PARAMS[cfg.log_rain]
 
-    # Fast lookup instead of if-else chain
-    params = get(HYDRO_PARAMS, cfg.log_rain, (1.0, 0.0, 0.0, 0.0))
-    c_q, c_rq, c_omega, c_omegastd = params
-
-    # NCEP parameter adjustment
-    if cfg.log_rain == 0 && cfg.log_clim == 1
-        c_q, c_rq, c_omega, c_omegastd = -1.27, 1.99, -16.54, 21.15
+    # NCEP parameter adjustment (only the Best-GREB scheme depends on the dataset)
+    if cfg.log_rain == 0
+        cfg.log_clim == 1 && (params = HYDRO_PARAMS_NCEP)
+        loaded_clim = LOADED_DATASET[] == :ncep ? 1 : LOADED_DATASET[] == :era ? 0 : nothing
+        if loaded_clim !== nothing && loaded_clim != cfg.log_clim
+            @warn "Hydrology coefficients do not match the loaded climatology: log_clim=$(cfg.log_clim) " *
+                  "selects $(cfg.log_clim == 1 ? "NCEP" : "ERA-Interim") coefficients, but the " *
+                  "$(LOADED_DATASET[]) dataset is loaded. Set log_clim=$loaded_clim to match."
+        end
     end
 
-    @info "⚙️ MSCM hydrology: log_rain=$(cfg.log_rain), log_clim=$(cfg.log_clim) → (c_q=$c_q, c_rq=$c_rq, c_omega=$c_omega, c_omegastd=$c_omegastd)"
+    cfg.c_q, cfg.c_rq, cfg.c_omega, cfg.c_omegastd = params
+
+    @info "⚙️ MSCM hydrology: log_rain=$(cfg.log_rain), log_clim=$(cfg.log_clim) → (c_q=$(cfg.c_q), c_rq=$(cfg.c_rq), c_omega=$(cfg.c_omega), c_omegastd=$(cfg.c_omegastd))"
+    return cfg
 end
 
 # ── notebook cell 80ac789e-4fe7-4184-9946-b8d7c24b04ea  (orig lines 408-544) ──
@@ -739,7 +745,9 @@ function load_greb_jdal2!(jdal2_dir::String; dataset::Symbol=:ncep)
     )
 
     # Use mixed dataset as fallback
-    files = get(file_map, dataset, file_map[:ncep])
+    haskey(file_map, dataset) || @warn "Unknown dataset $dataset; falling back to :ncep"
+    dataset = haskey(file_map, dataset) ? dataset : :ncep
+    files = file_map[dataset]
 
     println("📂 Loading 3D climatology ($dataset dataset)...")
     climatology_dir = joinpath(jdal2_dir, "climatology")
@@ -802,6 +810,7 @@ function load_greb_jdal2!(jdal2_dir::String; dataset::Symbol=:ncep)
     @. vclim_m = ifelse(vclim >= 0.0, vclim, 0.0)
     @. vclim_p = ifelse(vclim < 0.0, vclim, 0.0)
 
+    LOADED_DATASET[] = dataset
     println("✅ All GREB data loaded successfully from JDAL2")
 end
 
@@ -1678,7 +1687,7 @@ function forcing(it, year, cfg::PhysicsConfig, icmn_ctrl=zeros(xdim, ydim, 12); 
 
         # 💨 CO₂ scaling experiments ──────────────────────────────────────────────
     elseif cfg.experiment == :co2_double
-        CO2 = 680.0  # 2×CO₂ (already set, but explicit)
+        CO2 = 680.0  # 2×CO₂ scenario (control stays at cfg.co2_concentration)
 
     elseif cfg.experiment == :co2_quadruple
         CO2 = 1360.0  # 4×CO₂
