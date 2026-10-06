@@ -11,3 +11,6 @@
 
 # example outputs
 /examples/*.png
+
+# personal notes (not tracked)
+/claude/
