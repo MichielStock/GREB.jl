@@ -1,6 +1,6 @@
 # GREB Climate Model - Julia Implementation
 
-[![Julia](https://img.shields.io/badge/Julia-1.9+-9558B2?logo=julia)](https://julialang.org/)
+[![Julia](https://img.shields.io/badge/Julia-1.10+-9558B2?logo=julia)](https://julialang.org/)
 [![Pluto](https://img.shields.io/badge/Pluto-Interactive-purple)](https://github.com/fonsp/Pluto.jl)
 
 A high-performance Julia translation of the **Globally Resolved Energy Balance (GREB)** climate model, originally developed by Dietmar Dommenget and colleagues at Monash University. It is organized as a standard Julia package, with the original interactive [Pluto.jl](https://github.com/fonsp/Pluto.jl) notebook (including process-isolation controls for decomposition experiments) preserved under `notebooks/`.
@@ -76,7 +76,7 @@ Pkg.add(url="https://github.com/MichielStock/GREB.jl")
 
 ### 2. Install Julia
 
-Requires **Julia 1.9** or later. Download from [julialang.org](https://julialang.org/downloads/).
+Requires **Julia 1.10** or later. Download from [julialang.org](https://julialang.org/downloads/).
 
 ### 3. Instantiate the Package Environment
 
@@ -92,9 +92,7 @@ This installs the package dependencies from `Project.toml`:
 
 | Package | Purpose |
 |:--------|:--------|
-| `NCDatasets` | NetCDF I/O (optional) |
 | `LoopVectorization` | SIMD performance |
-| `StaticArrays` | Optimized array operations |
 | `Statistics` | Statistical functions |
 
 ### 4. Optional: the Interactive Notebook
