@@ -87,8 +87,8 @@ function run_greb(jdal2_dir::AbstractString;
 end
 
 # Default data directory: first CLI arg, else $GREB_DATA, else repo-root dataset.
-const DEFAULT_JDAL2_DIR = get(ENV, "GREB_DATA",
-    !isempty(ARGS) ? ARGS[1] : joinpath(@__DIR__, "..", "greb_dataset_jdal2"))
+const DEFAULT_JDAL2_DIR = !isempty(ARGS) ? ARGS[1] :
+    get(ENV, "GREB_DATA", joinpath(@__DIR__, "..", "greb_dataset_jdal2"))
 
 # Run automatically when executed as a script (`julia run_greb.jl`), but NOT when
 # `include`-d into an interactive session — so a REPL is never terminated.

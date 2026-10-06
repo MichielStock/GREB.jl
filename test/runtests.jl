@@ -115,6 +115,62 @@ using Test
         @test result.ctrl[1] isa MonthlyRecord
     end
 
+    @testset "hydro! with log_eva = 0 (skin temperature)" begin
+        # Regression: used a non-existent workspace field `ws.cE`.
+        Ts = fill(290.0, GREB.xdim, GREB.ydim); q = fill(0.008, GREB.xdim, GREB.ydim)
+        out = hydro!(Ts, q, TimeState(1, 1), PhysicsConfig(log_eva = 0), CirculationWorkspace())
+        @test all(isfinite, out.Q_lat)
+    end
+
+    @testset "circulation! does not reuse stale buffers" begin
+        # Regression: with heat diffusion/advection off, the Ta call added the
+        # humidity increments left in the shared workspace by the previous q call.
+        wz_air0, wz_vapor0 = copy(GREB.wz_air), copy(GREB.wz_vapor)
+        try
+            GREB.wz_air .= 1.0; GREB.wz_vapor .= 1.0
+            ws = CirculationWorkspace(); cfg = PhysicsConfig(log_hdif = false, log_hadv = false)
+            q = [0.001 * (1 + sin(i) * cos(j)) for i in 1:GREB.xdim, j in 1:GREB.ydim]
+            Ta = fill(270.0, GREB.xdim, GREB.ydim); dTa = similar(Ta)
+            circulation!(q, GREB.z_vapor, ws.dq_crcl, ws, TimeState(1, 1), cfg)
+            @test maximum(abs, ws.dq_crcl) > 0      # q circulation did run
+            circulation!(Ta, GREB.z_air, dTa, ws, TimeState(1, 1), cfg)
+            @test maximum(abs, dTa) == 0
+        finally
+            GREB.wz_air .= wz_air0; GREB.wz_vapor .= wz_vapor0
+        end
+    end
+
+    @testset "time_loop! returns month and record in the right order" begin
+        # Regression: `(mon, irec) = output!(…)` destructured a NamedTuple
+        # (irec=…, mon=…) by position, swapping the two counters.
+        n = (GREB.xdim, GREB.ydim)
+        Ts, Ta, To, q = fill(280.0, n), fill(280.0, n), fill(280.0, n), fill(0.005, n)
+        buf = MonthlyRecord[]
+        # it = 62 is the last step of 31 January
+        res = redirect_stdout(devnull) do
+            GREB.time_loop!(62, 1970, 340.0, 1, 0, Ts, Ta, q, To, buf,
+                            CirculationWorkspace(), MonthlyAccumulator(), TimeState(1, 1), PhysicsConfig())
+        end
+        @test length(buf) == 1
+        @test res.mon == 2
+        @test res.irec == 1
+    end
+
+    @testset "greb_model! keeps loaded flux corrections without jdal2_dir" begin
+        # Regression: for !log_topo_drsp && log_qflux_dmc, greb_model! reloaded the
+        # corrections from jdal2_dir = "" and zero-filled them.
+        TF0 = GREB.TF_correct[1]
+        try
+            GREB.TF_correct[1] = 1.0
+            redirect_stdout(devnull) do
+                greb_model!(0, 0, 0, PhysicsConfig(log_topo_drsp = false); jdal2_dir = "")
+            end
+            @test GREB.TF_correct[1] == 1.0
+        finally
+            GREB.TF_correct[1] = TF0
+        end
+    end
+
     @testset "read_jdal2 rejects non-JDAL2 input" begin
         tmp = tempname()
         write(tmp, "not a jdal2 file")

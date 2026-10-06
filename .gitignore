@@ -14,3 +14,6 @@
 
 # personal notes (not tracked)
 /claude/
+
+# input data (large, distributed separately; see DATA_README.md)
+/greb_dataset_jdal2/

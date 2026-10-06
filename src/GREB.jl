@@ -15,8 +15,6 @@ module GREB
 # =============================================================================
 
 using Statistics
-using NCDatasets
-using StaticArrays        # static longitude indices
 using LoopVectorization   # @turbo SIMD
 
 export PhysicsConfig, CirculationWorkspace, MonthlyAccumulator, TimeState, MonthlyRecord
@@ -254,9 +252,6 @@ begin
 
     # Climatology dataset loaded by `load_greb_jdal2!` (:none until data is loaded)
     const LOADED_DATASET = Ref(:none)
-
-    # 🎯 Cached Weight Arrays (avoid recomputation) ───
-    global WZ_CACHE = Dict{Float64,Matrix{Float64}}()
 end;
 
 # ── notebook cell d0d74213-96ad-4a45-9a31-37f640a21a45  (orig lines 378-400) ──
@@ -301,7 +296,6 @@ begin
     mutable struct CirculationWorkspace
         # Polar sub-stepping buffers
         T1h::Vector{Float64}      # polar sub-stepping
-        dTxh::Vector{Float64}     # polar tendencies
 
         # Circulation work arrays
         X_work::Matrix{Float64}   # circulation work array
@@ -311,7 +305,6 @@ begin
         dX_crcl::Matrix{Float64}  # circulation output
 
         # Tendency buffers 
-        temp_buf::Matrix{Float64}   # general workspace
         Q_sens_buf::Matrix{Float64} # Sensible heat flux buffer
         eva::Matrix{Float64}        # dq_eva
         rain::Matrix{Float64}       # dq_rain
@@ -369,13 +362,11 @@ begin
     function CirculationWorkspace()
         CirculationWorkspace(
             zeros(Float64, xdim),# T1h
-            zeros(Float64, xdim),# dTxh
             zeros(Float64, xdim, ydim),# X_work
             zeros(Float64, xdim, ydim),# dX_diff
             zeros(Float64, xdim, ydim),# dX_adv
             zeros(Float64, xdim, ydim),# dX_conv
             zeros(Float64, xdim, ydim),# dX_crcl
-            zeros(Float64, xdim, ydim),# temp_buf
             zeros(Float64, xdim, ydim), # Q_sens_buf
             zeros(Float64, xdim, ydim), # rain	
             zeros(Float64, xdim, ydim),# eva
@@ -511,7 +502,6 @@ begin
     # 🌍 Spatial CO₂ masking arrays ────────────────────────────────
     # Spatial fraction for regional CO₂ experiments
     co2_part = ones(Float64, xdim, ydim)    # Regional CO₂ mask (1.0 = full CO₂, 0.5 = half CO₂)
-    co2_part_scn = ones(Float64, xdim, ydim) # Scenario-specific spatial mask
 end;
 
 # ── notebook cell f8a2c2de-5045-4ab6-a6fa-7bca502afc9b  (orig lines 644-658) ──
@@ -610,7 +600,6 @@ end
 # ── notebook cell 0dbfb663-46e7-4873-ac77-1e8e392fe69d  (orig lines 737-749) ──
 begin
     # ☀️ Solar forcing storage
-    global sw_solar_forcing_data = nothing  # Will hold (48, 730) array when loaded
     global sw_solar_forcing_state = Ref(1.0)  # Runtime solar multiplier used by SWradiation!
 
     # 🔧 Flux correction arrays (initialised with zeros, overwritten if files exist)
@@ -688,16 +677,10 @@ begin
     wsclim_anom_cc = zeros(Float64, xdim, ydim, nstep_yr) # wind speed [m/s]
 
     # 🌬️ Precomputed wind sign splits ──────────────────
-    uclim_m = zeros(Float64, xdim, ydim, nstep_yr)   # negative u components
-    uclim_p = zeros(Float64, xdim, ydim, nstep_yr)   # positive u components  
-    vclim_m = zeros(Float64, xdim, ydim, nstep_yr)   # negative v components
-    vclim_p = zeros(Float64, xdim, ydim, nstep_yr)   # positive v components
-
-    # Initialize wind component separation (CRITICAL: affects advection)
-    @. uclim_m = ifelse(uclim >= 0.0, uclim, 0.0)  # positive winds only
-    @. uclim_p = ifelse(uclim < 0.0, uclim, 0.0)   # negative winds only
-    @. vclim_m = ifelse(vclim >= 0.0, vclim, 0.0)  # positive winds only
-    @. vclim_p = ifelse(vclim < 0.0, vclim, 0.0)   # negative winds only
+    uclim_m = zeros(Float64, xdim, ydim, nstep_yr)   # u where u >= 0 (eastward), else 0
+    uclim_p = zeros(Float64, xdim, ydim, nstep_yr)   # u where u < 0 (westward), else 0
+    vclim_m = zeros(Float64, xdim, ydim, nstep_yr)   # v where v >= 0 (northward), else 0
+    vclim_p = zeros(Float64, xdim, ydim, nstep_yr)   # v where v < 0 (southward), else 0
     Toclim = zeros(Float64, xdim, ydim, nstep_yr)   # deep ocean temperature [K]
     cldclim = zeros(Float64, xdim, ydim, nstep_yr)   # cloud cover fraction
     swetclim = zeros(Float64, xdim, ydim, nstep_yr)   # soil wetness [0-1]
@@ -854,39 +837,6 @@ begin
     qsensmn = zeros(Float64, xdim, ydim)   # sensible heat flux
     ftmn = zeros(Float64, xdim, ydim)   # temperature flux correction
     fqmn = zeros(Float64, xdim, ydim)   # humidity flux correction
-end;
-
-# ── notebook cell a8b5fa01-0526-46f4-9aa0-31b52398a2bd  (orig lines 1124-1143) ──
-begin
-    # Monthly-mean buffers (xdim, ydim) 
-    Tmm = zeros(Float64, xdim, ydim)   # surface temperature
-    Tamm = zeros(Float64, xdim, ydim)   # air temperature
-    Tomm = zeros(Float64, xdim, ydim)   # deep ocean temperature
-    qmm = zeros(Float64, xdim, ydim)   # humidity
-    apmm = zeros(Float64, xdim, ydim)   # albedo
-
-    # additional monthly buffers
-    icmm = zeros(Float64, xdim, ydim)   # ice cover fraction
-    prmm = zeros(Float64, xdim, ydim)   # precipitation tendency
-    evmm = zeros(Float64, xdim, ydim)   # evaporation tendency
-    qcrclmm = zeros(Float64, xdim, ydim)   # circulation tendency
-    swmm = zeros(Float64, xdim, ydim)   # shortwave radiation
-    lwmm = zeros(Float64, xdim, ydim)   # longwave radiation
-    qlatmm = zeros(Float64, xdim, ydim)   # latent heat flux
-    qsensmm = zeros(Float64, xdim, ydim)   # sensible heat flux
-end;
-
-# ── notebook cell 1bdeea50-a73b-47a5-b941-d9d3374f54cf  (orig lines 1144-1156) ──
-begin
-    # Control run monthly means (for anomaly calculation)
-    Tmn_ctrl = zeros(Float64, xdim, ydim, 12)  # surface temperature
-    Tamn_ctrl = zeros(Float64, xdim, ydim, 12)  # air temperature
-    Tomn_ctrl = zeros(Float64, xdim, ydim, 12)  # deep ocean temperature
-    qmn_ctrl = zeros(Float64, xdim, ydim, 12)  # humidity
-    icmn_ctrl = zeros(Float64, xdim, ydim, 12)  # ice cover
-    prmn_ctrl = zeros(Float64, xdim, ydim, 12)  # precipitation
-    evamn_ctrl = zeros(Float64, xdim, ydim, 12)  # evaporation
-    qcrclmn_ctrl = zeros(Float64, xdim, ydim, 12) # circulation
 end;
 
 # ── notebook cell 7a06bf0d-a61c-4d28-b144-2725fe90ae62  (orig lines 1179-1182) ──
@@ -1165,8 +1115,8 @@ function hydro!(Ts, q, timestate, cfg::PhysicsConfig, ws::CirculationWorkspace)
                 gust = ifelse(z_topo[i, j] > 0.0, 132.25, 29.16)
                 wind = sqrt(ws.ws_base[i, j]*ws.ws_base[i, j] + gust)
 
-                ws.cE[i, j] = ifelse(z_topo[i, j] > 0.0, cE_land, cE_ocean)
-                ws.Q_lat_buf[i, j] = ws.cE[i, j] * wind * ρ_air * cq_latent * (q[i, j] - qs_val) * swet[i, j]
+                ws.cE_buf[i, j] = ifelse(z_topo[i, j] > 0.0, cE_land, cE_ocean)
+                ws.Q_lat_buf[i, j] = ws.cE_buf[i, j] * wind * ρ_air * cq_latent * (q[i, j] - qs_val) * swet[i, j]
             end
         end
     else
@@ -1345,9 +1295,9 @@ function diffusion!(T1, h_scl, ws::CirculationWorkspace, timestate)
     jm3, jp3 = lon_jm3, lon_jp3
 
     # ----- Precompute k‑independent terms for the poles -----
-    # For k == 1 (North Pole)
+    # For k == 1 (South Pole; lat_grid[1] = -88.1°)
     @. ws.term_north = ccy * wz[:, 2] * (T1[:, 2] - T1[:, 1])
-    # For k == ydim (South Pole)
+    # For k == ydim (North Pole)
     @. ws.term_south = ccy * wz[:, ydim-1] * (T1[:, ydim-1] - T1[:, ydim])
 
     for k in 1:ydim
@@ -1472,7 +1422,7 @@ function advection!(T1, h_scl, ws::CirculationWorkspace, timestate, cfg::Physics
 
     @inbounds for k in 1:ydim
         # ----- Meridional (v) advection -----
-        if k == 1          # North Pole
+        if k == 1          # South Pole
             @turbo for j in 1:xdim
                 v_p = vclim_p_t[j, k]
                 ws.dX_adv[j, k] += ccy * v_p * (
@@ -1515,7 +1465,7 @@ function advection!(T1, h_scl, ws::CirculationWorkspace, timestate, cfg::Physics
                     v_p * wz[j, kp1] * (T1[j, k] - T1[j, kp1])
                 )
             end
-        else               # k == ydim (South Pole)
+        else               # k == ydim (North Pole)
             @turbo for j in 1:xdim
                 km1, km2 = k-1, k-2
                 v_m = vclim_m_t[j, k]
@@ -1598,6 +1548,12 @@ function circulation!(X_in, h_scl, dX_out, ws::CirculationWorkspace, timestate, 
     do_conv = cfg.log_conv == 0 && h_scl == z_vapor
 
     copyto!(ws.X_work, X_in)
+
+    # Zero buffers of processes that are off for this tracer; the buffers are shared
+    # between the heat and vapour calls and would otherwise carry stale tendencies.
+    (do_diff_v || do_diff_h) || fill!(ws.dX_diff, 0.0)
+    (do_adv_v || do_adv_h) || fill!(ws.dX_adv, 0.0)
+    do_conv || fill!(ws.dX_conv, 0.0)
 
     for _tt in 1:ntime
         do_diff_v && diffusion!(ws.X_work, h_scl, ws, timestate)
@@ -1990,7 +1946,7 @@ function time_loop!(it, year, CO2, mon, irec, Ts, Ta, q, To, output_buf,
 
 
     # Output and diagnostics
-    (mon, irec) = output!(it, irec, mon, Ts, Ta, To, q, tend.albedo,
+    (; mon, irec) = output!(it, irec, mon, Ts, Ta, To, q, tend.albedo,
         tend.ice_cover, ws.precip_out, ws.evap_out, ws.qcrcl_out,
         tend.SW, tend.LW_surf, tend.Q_lat, tend.Q_sens,
         output_buf, acc, timestate)
@@ -2160,8 +2116,12 @@ function greb_model!(time_flux, time_ctrl, time_scnr, cfg::PhysicsConfig; jdal2_
     # ── 2. Flux-correction spin-up ──────────────────────────────
     if cfg.log_topo_drsp || cfg.log_qflux_dmc
         if !cfg.log_topo_drsp && cfg.log_qflux_dmc
-            println("% loading flux correction fields...")
-            load_flux_corrections_jdal2!(jdal2_dir)
+            if isempty(jdal2_dir)
+                @info "jdal2_dir not given; keeping the flux corrections already loaded"
+            else
+                println("% loading flux correction fields...")
+                load_flux_corrections_jdal2!(jdal2_dir)
+            end
         end
         println("% flux correction  CO2 = ", CO2_ctrl)
         qflux_correction!(CO2_ctrl, Ts_ini, Ta_ini, q_ini, To_ini, timestate, cfg, ws, time_flux)
@@ -2190,7 +2150,7 @@ function greb_model!(time_flux, time_ctrl, time_scnr, cfg::PhysicsConfig; jdal2_
     timestate = TimeState(1, 1)  # Initialize time state
 
     for it in 1:(time_ctrl*nstep_yr)
-        (mon, irec) = time_loop!(it, year, CO2_ctrl, mon, irec,
+        (; mon, irec) = time_loop!(it, year, CO2_ctrl, mon, irec,
             Ts, Ta, q, To, ctrl_output, ws, acc, timestate, cfg)
         if mod(it, nstep_yr) == 0
             year += 1
@@ -2242,7 +2202,7 @@ function greb_model!(time_flux, time_ctrl, time_scnr, cfg::PhysicsConfig; jdal2_
             @. Ts = ifelse(z_topo < 0.0, Tclim[:, :, ityr_now] + 1.0, Ts)
         end
 
-        (mon, irec) = time_loop!(it, year, CO2, mon, irec,
+        (; mon, irec) = time_loop!(it, year, CO2, mon, irec,
             Ts, Ta, q, To, scnr_output, ws, acc, timestate, cfg)
 
         if mod(it, nstep_yr) == 0
