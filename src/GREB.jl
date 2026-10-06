@@ -688,10 +688,10 @@ begin
     wsclim_anom_cc = zeros(Float64, xdim, ydim, nstep_yr) # wind speed [m/s]
 
     # 🌬️ Precomputed wind sign splits ──────────────────
-    uclim_m = zeros(Float64, xdim, ydim, nstep_yr)   # negative u components
-    uclim_p = zeros(Float64, xdim, ydim, nstep_yr)   # positive u components  
-    vclim_m = zeros(Float64, xdim, ydim, nstep_yr)   # negative v components
-    vclim_p = zeros(Float64, xdim, ydim, nstep_yr)   # positive v components
+    uclim_m = zeros(Float64, xdim, ydim, nstep_yr)   # u where u >= 0 (eastward), else 0
+    uclim_p = zeros(Float64, xdim, ydim, nstep_yr)   # u where u < 0 (westward), else 0
+    vclim_m = zeros(Float64, xdim, ydim, nstep_yr)   # v where v >= 0 (northward), else 0
+    vclim_p = zeros(Float64, xdim, ydim, nstep_yr)   # v where v < 0 (southward), else 0
 
     # Initialize wind component separation (CRITICAL: affects advection)
     @. uclim_m = ifelse(uclim >= 0.0, uclim, 0.0)  # positive winds only
@@ -1165,8 +1165,8 @@ function hydro!(Ts, q, timestate, cfg::PhysicsConfig, ws::CirculationWorkspace)
                 gust = ifelse(z_topo[i, j] > 0.0, 132.25, 29.16)
                 wind = sqrt(ws.ws_base[i, j]*ws.ws_base[i, j] + gust)
 
-                ws.cE[i, j] = ifelse(z_topo[i, j] > 0.0, cE_land, cE_ocean)
-                ws.Q_lat_buf[i, j] = ws.cE[i, j] * wind * ρ_air * cq_latent * (q[i, j] - qs_val) * swet[i, j]
+                ws.cE_buf[i, j] = ifelse(z_topo[i, j] > 0.0, cE_land, cE_ocean)
+                ws.Q_lat_buf[i, j] = ws.cE_buf[i, j] * wind * ρ_air * cq_latent * (q[i, j] - qs_val) * swet[i, j]
             end
         end
     else
@@ -1345,9 +1345,9 @@ function diffusion!(T1, h_scl, ws::CirculationWorkspace, timestate)
     jm3, jp3 = lon_jm3, lon_jp3
 
     # ----- Precompute k‑independent terms for the poles -----
-    # For k == 1 (North Pole)
+    # For k == 1 (South Pole; lat_grid[1] = -88.1°)
     @. ws.term_north = ccy * wz[:, 2] * (T1[:, 2] - T1[:, 1])
-    # For k == ydim (South Pole)
+    # For k == ydim (North Pole)
     @. ws.term_south = ccy * wz[:, ydim-1] * (T1[:, ydim-1] - T1[:, ydim])
 
     for k in 1:ydim
@@ -1472,7 +1472,7 @@ function advection!(T1, h_scl, ws::CirculationWorkspace, timestate, cfg::Physics
 
     @inbounds for k in 1:ydim
         # ----- Meridional (v) advection -----
-        if k == 1          # North Pole
+        if k == 1          # South Pole
             @turbo for j in 1:xdim
                 v_p = vclim_p_t[j, k]
                 ws.dX_adv[j, k] += ccy * v_p * (
@@ -1515,7 +1515,7 @@ function advection!(T1, h_scl, ws::CirculationWorkspace, timestate, cfg::Physics
                     v_p * wz[j, kp1] * (T1[j, k] - T1[j, kp1])
                 )
             end
-        else               # k == ydim (South Pole)
+        else               # k == ydim (North Pole)
             @turbo for j in 1:xdim
                 km1, km2 = k-1, k-2
                 v_m = vclim_m_t[j, k]
@@ -1598,6 +1598,12 @@ function circulation!(X_in, h_scl, dX_out, ws::CirculationWorkspace, timestate, 
     do_conv = cfg.log_conv == 0 && h_scl == z_vapor
 
     copyto!(ws.X_work, X_in)
+
+    # Zero buffers of processes that are off for this tracer; the buffers are shared
+    # between the heat and vapour calls and would otherwise carry stale tendencies.
+    (do_diff_v || do_diff_h) || fill!(ws.dX_diff, 0.0)
+    (do_adv_v || do_adv_h) || fill!(ws.dX_adv, 0.0)
+    do_conv || fill!(ws.dX_conv, 0.0)
 
     for _tt in 1:ntime
         do_diff_v && diffusion!(ws.X_work, h_scl, ws, timestate)
@@ -1990,7 +1996,7 @@ function time_loop!(it, year, CO2, mon, irec, Ts, Ta, q, To, output_buf,
 
 
     # Output and diagnostics
-    (mon, irec) = output!(it, irec, mon, Ts, Ta, To, q, tend.albedo,
+    (; mon, irec) = output!(it, irec, mon, Ts, Ta, To, q, tend.albedo,
         tend.ice_cover, ws.precip_out, ws.evap_out, ws.qcrcl_out,
         tend.SW, tend.LW_surf, tend.Q_lat, tend.Q_sens,
         output_buf, acc, timestate)
@@ -2160,8 +2166,12 @@ function greb_model!(time_flux, time_ctrl, time_scnr, cfg::PhysicsConfig; jdal2_
     # ── 2. Flux-correction spin-up ──────────────────────────────
     if cfg.log_topo_drsp || cfg.log_qflux_dmc
         if !cfg.log_topo_drsp && cfg.log_qflux_dmc
-            println("% loading flux correction fields...")
-            load_flux_corrections_jdal2!(jdal2_dir)
+            if isempty(jdal2_dir)
+                @info "jdal2_dir not given; keeping the flux corrections already loaded"
+            else
+                println("% loading flux correction fields...")
+                load_flux_corrections_jdal2!(jdal2_dir)
+            end
         end
         println("% flux correction  CO2 = ", CO2_ctrl)
         qflux_correction!(CO2_ctrl, Ts_ini, Ta_ini, q_ini, To_ini, timestate, cfg, ws, time_flux)
@@ -2190,7 +2200,7 @@ function greb_model!(time_flux, time_ctrl, time_scnr, cfg::PhysicsConfig; jdal2_
     timestate = TimeState(1, 1)  # Initialize time state
 
     for it in 1:(time_ctrl*nstep_yr)
-        (mon, irec) = time_loop!(it, year, CO2_ctrl, mon, irec,
+        (; mon, irec) = time_loop!(it, year, CO2_ctrl, mon, irec,
             Ts, Ta, q, To, ctrl_output, ws, acc, timestate, cfg)
         if mod(it, nstep_yr) == 0
             year += 1
@@ -2242,7 +2252,7 @@ function greb_model!(time_flux, time_ctrl, time_scnr, cfg::PhysicsConfig; jdal2_
             @. Ts = ifelse(z_topo < 0.0, Tclim[:, :, ityr_now] + 1.0, Ts)
         end
 
-        (mon, irec) = time_loop!(it, year, CO2, mon, irec,
+        (; mon, irec) = time_loop!(it, year, CO2, mon, irec,
             Ts, Ta, q, To, scnr_output, ws, acc, timestate, cfg)
 
         if mod(it, nstep_yr) == 0
